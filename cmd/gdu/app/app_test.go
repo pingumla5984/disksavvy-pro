@@ -1,0 +1,1093 @@
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
+
+	"github.com/dundee/gdu/v5/internal/common"
+	"github.com/dundee/gdu/v5/internal/testapp"
+	"github.com/dundee/gdu/v5/internal/testdev"
+	"github.com/dundee/gdu/v5/internal/testdir"
+	"github.com/dundee/gdu/v5/pkg/cleanup"
+	"github.com/dundee/gdu/v5/pkg/device"
+	gfs "github.com/dundee/gdu/v5/pkg/fs"
+	"github.com/stretchr/testify/assert"
+)
+
+func init() {
+	log.SetLevel(log.WarnLevel)
+}
+
+func TestVersion(t *testing.T) {
+	out, err := runApp(
+		&Flags{ShowVersion: true},
+		[]string{},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "Version:\t development")
+	assert.Nil(t, err)
+}
+
+func TestShouldRunInNonInteractiveModeInteractiveOverridesNoTTY(t *testing.T) {
+	flags := &Flags{Interactive: true}
+
+	assert.False(t, flags.ShouldRunInNonInteractiveMode(false))
+}
+
+func TestShouldRunInNonInteractiveMode(t *testing.T) {
+	flags := &Flags{NonInteractive: true}
+
+	assert.True(t, flags.ShouldRunInNonInteractiveMode(false))
+}
+
+func TestShouldRunInNonInteractiveModeInteractiveKeepsNonInteractiveOnlyFlags(t *testing.T) {
+	flags := &Flags{Interactive: true, Summarize: true}
+
+	assert.True(t, flags.ShouldRunInNonInteractiveMode(false))
+}
+
+func TestInteractiveAndNonInteractiveConflict(t *testing.T) {
+	out, err := runApp(
+		&Flags{Interactive: true, NonInteractive: true},
+		[]string{"."},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.ErrorContains(t, err, "--interactive and --non-interactive cannot be used at once")
+}
+
+func TestAnalyzePath(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null"},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithShowItemCountNonInteractive(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowItemCount: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.Regexp(t, regexp.MustCompile(`(?m)\s+\d+\s+/nested$`), out)
+}
+
+func TestSequentialScanning(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", SequentialScanning: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestFollowSymlinks(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", FollowSymlinks: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestShowAnnexedSize(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowAnnexedSize: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestExclusiveSize(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ExclusiveSize: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathProfiling(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", Profiling: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithIgnoring(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:           "/dev/null",
+			IgnoreDirPatterns: []string{"/(abc)+"},
+			NoHidden:          true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithIgnoringPatternError(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:           "/dev/null",
+			IgnoreDirPatterns: []string{"[[["},
+			NoHidden:          true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, out, "")
+	assert.NotNil(t, err)
+}
+
+func TestAnalyzePathWithIgnoringFromNotExistingFile(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:        "/dev/null",
+			IgnoreFromFile: "file",
+			NoHidden:       true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, out, "")
+	assert.NotNil(t, err)
+}
+
+func TestAnalyzePathWithIgnoringFromNotExistingGitignoreFile(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreFromGitignore: "file",
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, out, "")
+	assert.NotNil(t, err)
+}
+
+// writeGitignore puts a gitignore file in a temp dir and returns its path.
+func writeGitignore(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), ".gitignore")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestAnalyzePathWithIgnoringFromGitignoreFile(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreFromGitignore: writeGitignore(t, "nested/\n"),
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.NotContains(t, out, "nested")
+}
+
+// gdu resolves every scanned path with filepath.Abs, so a pattern anchored
+// with a leading / has to be matched against the scanned root to fire at all.
+func TestAnalyzePathWithRootedGitignorePattern(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreFromGitignore: writeGitignore(t, "/nested\n"),
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.NotContains(t, out, "nested")
+}
+
+func TestAnalyzePathWithRootedGitignorePatternBelowRoot(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	// subnested lives at test_dir/nested/subnested, so anchoring it to the
+	// scanned root must not prune it
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreFromGitignore: writeGitignore(t, "/subnested\n"),
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.Contains(t, out, "nested")
+}
+
+func TestAnalyzePathWithGitignoreAndPatternCombined(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	// both sources apply; neither is dropped because the other was given
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreDirPatterns:   []string{".*/(abc)+"},
+			IgnoreFromGitignore: writeGitignore(t, "nested/\n"),
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.NotContains(t, out, "nested")
+}
+
+func TestAnalyzePathWithNegatedGitignorePattern(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:             "/dev/null",
+			IgnoreFromGitignore: writeGitignore(t, "nested/\n!nested/file2\n"),
+			NoHidden:            true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, out, "")
+	assert.NotNil(t, err)
+}
+
+func TestAnalyzePathWithGui(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null"},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithGuiNoColor(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", NoColor: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiShowMTimeAndItemCount(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowItemCount: true, ShowMTime: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiNoDelete(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", NoDelete: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiNoViewFile(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", NoViewFile: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiNoSpawnShell(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", NoSpawnShell: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiCtrlCQuits(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", CtrlCQuits: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiDeleteInParallel(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", DeleteInParallel: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestGuiTrashCommand(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", TrashCommand: "trash-put"},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithGuiBackgroundDeletion(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", DeleteInBackground: true},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithDefaultSorting(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile: "/dev/null",
+			Sorting: Sorting{
+				By:    "name",
+				Order: "asc",
+			},
+		},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithStyle(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile: "/dev/null",
+			Style: Style{
+				SelectedRow: ColorStyle{
+					TextColor:       "black",
+					BackgroundColor: "red",
+				},
+				Marked: ColorStyle{
+					TextColor:       "white",
+					BackgroundColor: "blue",
+				},
+				ProgressModal: ProgressModalOpts{
+					CurrentItemNameMaxLen: 10,
+				},
+				Footer: FooterColorStyle{
+					TextColor:       "black",
+					BackgroundColor: "red",
+					NumberColor:     "white",
+				},
+				Header: HeaderColorStyle{
+					TextColor:       "black",
+					BackgroundColor: "red",
+					Hidden:          true,
+				},
+				ResultRow: ResultRowColorStyle{
+					NumberColor:    "orange",
+					DirectoryColor: "blue",
+				},
+				UseOldSizeBar:     true,
+				ShowBarPercentage: true,
+				ShowItemCountBar:  true,
+			},
+		},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathNoUnicode(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:   "/dev/null",
+			NoUnicode: true,
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithExport(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer func() {
+		os.Remove("output.json")
+	}()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputFile: "output.json"},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.NotEmpty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestAnalyzePathWithCustomizedExport(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer os.Remove("output.json")
+
+	out, err := runApp(
+		&Flags{
+			LogFile:     "/dev/null",
+			OutputFile:  "output.json",
+			OutputAttrs: "asize,dsize",
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.NoError(t, err)
+
+	content, err := os.ReadFile("output.json")
+	assert.NoError(t, err)
+
+	var report []any
+	assert.NoError(t, json.Unmarshal(content, &report))
+	assertOutputAttributes(t, report[3])
+}
+
+func assertOutputAttributes(t *testing.T, value any) {
+	t.Helper()
+
+	switch value := value.(type) {
+	case []any:
+		for _, child := range value {
+			assertOutputAttributes(t, child)
+		}
+	case map[string]any:
+		assert.Contains(t, value, "name")
+		for attribute := range value {
+			assert.Contains(t, []string{"name", "asize", "dsize"}, attribute)
+		}
+	default:
+		t.Fatalf("unexpected JSON value %T", value)
+	}
+}
+
+func TestOutputAttributesRequireExport(t *testing.T) {
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputAttrs: "asize"},
+		nil,
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.EqualError(t, err, "--output-attrs requires --output-file")
+}
+
+func TestOutputAttributesRejectUnknownAttribute(t *testing.T) {
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputFile: "output.json", OutputAttrs: "size"},
+		nil,
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.EqualError(t, err, `unknown JSON output attribute "size"`)
+}
+
+func TestAnalyzePathWithExportAndTop(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer func() {
+		os.Remove("output.json")
+	}()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputFile: "output.json", Top: 2},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+
+	content, err := os.ReadFile("output.json")
+	assert.Nil(t, err)
+	assert.Contains(t, string(content), `"name":"file"`)
+	assert.Contains(t, string(content), `"name":"file2"`)
+	assert.NotContains(t, string(content), `"name":"nested"`)
+}
+
+func TestAnalyzePathWithExportAndDepth(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer func() {
+		os.Remove("output.json")
+	}()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputFile: "output.json", Depth: 1},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+
+	content, err := os.ReadFile("output.json")
+	assert.Nil(t, err)
+	assert.Contains(t, string(content), `"name":"nested"`)
+	assert.NotContains(t, string(content), `"name":"subnested"`)
+	assert.Contains(t, string(content), `"name":"nested","asize":`)
+	assert.Contains(t, string(content), `"items":`)
+}
+
+func TestAnalyzePathWithExportAndSummarize(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer func() {
+		os.Remove("output.json")
+	}()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", OutputFile: "output.json", Summarize: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+
+	content, err := os.ReadFile("output.json")
+	assert.Nil(t, err)
+	assert.Contains(t, string(content), "test_dir")
+	assert.NotContains(t, string(content), `"name":"nested"`)
+}
+
+func TestAnalyzePathWithChdir(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{
+			LogFile:   "/dev/null",
+			ChangeCwd: true,
+		},
+		[]string{"test_dir"},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestReadAnalysisFromFile(t *testing.T) {
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", InputFile: "../../../internal/testdata/test.json"},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.NotEmpty(t, out)
+	assert.Contains(t, out, "main.go")
+	assert.Nil(t, err)
+}
+
+func TestReadWrongAnalysisFromFile(t *testing.T) {
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", InputFile: "../../../internal/testdata/wrong.json"},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Contains(t, err.Error(), "array of maps not found")
+}
+
+func TestWrongCombinationOfPrefixes(t *testing.T) {
+	out, err := runApp(
+		&Flags{NoPrefix: true, UseSIPrefix: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Contains(t, err.Error(), "cannot be used at once")
+}
+
+func TestReadWrongAnalysisFromNotExistingFile(t *testing.T) {
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", InputFile: "xxx.json"},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Empty(t, out)
+	assert.Contains(t, err.Error(), "no such file or directory")
+}
+
+func TestAnalyzePathWithErr(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	buff := bytes.NewBufferString("")
+
+	app := App{
+		Flags:       &Flags{LogFile: "/dev/null"},
+		Args:        []string{"xxx"},
+		Istty:       false,
+		Writer:      buff,
+		TermApp:     testapp.CreateMockedApp(false),
+		Getter:      testdev.DevicesInfoGetterMock{},
+		PathChecker: os.Stat,
+	}
+	err := app.Run()
+
+	assert.Equal(t, "", strings.TrimSpace(buff.String()))
+	assert.Contains(t, err.Error(), "no such file or directory")
+}
+
+func TestNoCross(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", NoCross: true},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "nested")
+	assert.Nil(t, err)
+}
+
+func TestWebFlagCreatesWebUIAndHonorsNoDelete(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	// Pre-bind the address so StartUILoop fails fast on net.Listen instead of
+	// actually serving; this only needs to exercise createUI's webUI
+	// construction and NoDelete wiring, not a live server.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	defer blocker.Close()
+
+	_, err = runApp(
+		&Flags{
+			LogFile:      "/dev/null",
+			Web:          true,
+			NoDelete:     true,
+			TrashCommand: "trash-put",
+			WebConfig:    WebConfig{Listen: blocker.Addr().String()},
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.ErrorContains(t, err, "binding")
+}
+
+func TestWebFlagRejectsInvalidCleanupRule(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	_, err := runApp(
+		&Flags{
+			LogFile: "/dev/null",
+			Web:     true,
+			Cleanup: cleanup.Config{Rules: []cleanup.Rule{{Category: "junk", Dir: "x"}}},
+		},
+		[]string{"test_dir"},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.ErrorContains(t, err, `cleanup config: cleanup rule 1: unknown category "junk"`)
+}
+
+func TestCleanupConfigFromYAML(t *testing.T) {
+	var f Flags
+	err := yaml.Unmarshal([]byte(`
+cleanup:
+  exclude: [~/work]
+  rules:
+    - category: build-artifact
+      confidence: safe
+      dir: .gradle
+      markers: [build.gradle]
+`), &f)
+	assert.NoError(t, err)
+	assert.Equal(t, cleanup.Config{
+		Exclude: []string{"~/work"},
+		Rules: []cleanup.Rule{{
+			Category: cleanup.BuildArtifact, Confidence: cleanup.Safe,
+			Dir: ".gradle", Markers: []string{"build.gradle"},
+		}},
+	}, f.Cleanup)
+}
+
+func TestListDevices(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowDisks: true},
+		[]string{},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Contains(t, out, "Device")
+	assert.Nil(t, err)
+}
+
+func TestListDevicesToFile(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+	defer func() {
+		os.Remove("output.json")
+	}()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowDisks: true, OutputFile: "output.json"},
+		[]string{},
+		false,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, "", out)
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+func TestListDevicesWithGui(t *testing.T) {
+	fin := testdir.CreateTestDir()
+	defer fin()
+
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", ShowDisks: true},
+		[]string{},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Nil(t, err)
+	assert.Empty(t, out)
+}
+
+func TestMaxCores(t *testing.T) {
+	_, err := runApp(
+		&Flags{LogFile: "/dev/null", MaxCores: 1},
+		[]string{},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.Equal(t, 1, runtime.GOMAXPROCS(0))
+	assert.Nil(t, err)
+}
+
+func TestMaxCoresHighEdge(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("Skipping on a single core CPU")
+	}
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", MaxCores: runtime.NumCPU() + 1},
+		[]string{},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.NotEqual(t, runtime.NumCPU(), runtime.GOMAXPROCS(0))
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+func TestMaxCoresLowEdge(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("Skipping on a single core CPU")
+	}
+	out, err := runApp(
+		&Flags{LogFile: "/dev/null", MaxCores: -100},
+		[]string{},
+		true,
+		testdev.DevicesInfoGetterMock{},
+	)
+
+	assert.NotEqual(t, runtime.NumCPU(), runtime.GOMAXPROCS(0))
+	assert.Empty(t, out)
+	assert.Nil(t, err)
+}
+
+type uiTimeFilterMock struct {
+	timeFilter common.TimeFilter
+}
+
+func (m *uiTimeFilterMock) ListDevices(getter device.DevicesInfoGetter) error { return nil }
+func (m *uiTimeFilterMock) AnalyzePath(path string, parentDir gfs.Item) error { return nil }
+func (m *uiTimeFilterMock) AnalyzePaths(paths []string) error                 { return nil }
+func (m *uiTimeFilterMock) ReadAnalysis(input io.Reader) error                { return nil }
+func (m *uiTimeFilterMock) ReadFromStorage(storagePath, path string) error    { return nil }
+func (m *uiTimeFilterMock) SetIgnoreTypes(types []string)                     {}
+func (m *uiTimeFilterMock) SetIgnoreDirPaths(paths []string)                  {}
+func (m *uiTimeFilterMock) SetIgnoreDirPatterns(paths []string) error         { return nil }
+func (m *uiTimeFilterMock) SetIgnoreFromFile(ignoreFile string) error         { return nil }
+func (m *uiTimeFilterMock) SetIgnoreHidden(value bool)                        {}
+func (m *uiTimeFilterMock) SetIgnoreOtherFilesystems(value bool)              {}
+func (m *uiTimeFilterMock) SetIncludeTypes(types []string)                    {}
+func (m *uiTimeFilterMock) SetFollowSymlinks(value bool)                      {}
+func (m *uiTimeFilterMock) SetShowAnnexedSize(value bool)                     {}
+func (m *uiTimeFilterMock) SetExclusiveSize(value bool)                       {}
+func (m *uiTimeFilterMock) SetAnalyzer(analyzer common.Analyzer)              {}
+func (m *uiTimeFilterMock) SetIgnoreFromGitignoreFile(ignoreFile string, scanRoots []string) error {
+	return nil
+}
+func (m *uiTimeFilterMock) SetTimeFilter(timeFilter common.TimeFilter) {
+	m.timeFilter = timeFilter
+}
+func (m *uiTimeFilterMock) SetArchiveBrowsing(value bool)   {}
+func (m *uiTimeFilterMock) SetCollapsePath(value bool)      {}
+func (m *uiTimeFilterMock) SetShowSymlinkTarget(value bool) {}
+func (m *uiTimeFilterMock) StartUILoop() error              { return nil }
+
+func TestSetTimeFiltersInvalid(t *testing.T) {
+	a := &App{Flags: &Flags{Since: "not-a-date"}}
+	ui := &uiTimeFilterMock{}
+
+	err := a.setTimeFilters(ui)
+
+	assert.ErrorContains(t, err, "invalid time filter")
+}
+
+func TestSetTimeFiltersSetsFilter(t *testing.T) {
+	futureDate := time.Now().Add(48 * time.Hour).Format("2006-01-02")
+	a := &App{Flags: &Flags{Since: futureDate}}
+	ui := &uiTimeFilterMock{}
+
+	err := a.setTimeFilters(ui)
+
+	assert.Nil(t, err)
+	if assert.NotNil(t, ui.timeFilter) {
+		assert.False(t, ui.timeFilter(time.Now()))
+		assert.True(t, ui.timeFilter(time.Now().Add(72*time.Hour)))
+	}
+}
+
+// nolint: unparam // Why: it's used in linux tests
+func runApp(flags *Flags, args []string, istty bool, getter device.DevicesInfoGetter) (output string, err error) {
+	buff := bytes.NewBufferString("")
+
+	app := App{
+		Flags:       flags,
+		Args:        args,
+		Istty:       istty,
+		Writer:      buff,
+		TermApp:     testapp.CreateMockedApp(false),
+		Getter:      getter,
+		PathChecker: testdir.MockedPathChecker,
+	}
+	err = app.Run()
+
+	return strings.TrimSpace(buff.String()), err
+}
